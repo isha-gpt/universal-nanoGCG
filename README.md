@@ -116,8 +116,6 @@ universalGCG extends the original config file which can be used to set the attac
 
 - `dual_model: Optional[transformers.PreTrainedModel] = None` - A second model to use for the optimization.
 
-- `dual_tokenizer: Optional[transformers.PreTrainedTokenizer] = None` - The tokenizer associated with the second model.
-
 - `incremental: bool = False`- Zou et al note in their paper "Additionally, we find that incorporating new prompts incrementally, only after identifying a candidate that works as an adversarial example for earlier ones, yields better results than attempting to optimize all prompts at once from the start." If set to True, we perform an incremental optimization: every num_steps // len(prompts) steps, a new prompt is simply added to the optimization. We have not yet implemented the efficacy check before adding a new prompt.
 
 ------------------------------------------------------------------------------------------------------------------------

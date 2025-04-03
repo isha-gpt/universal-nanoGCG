@@ -220,13 +220,13 @@ class UniversalGCG(GCG):
                 self.init_target_embeds.repeat(true_buffer_size, 1, 1),
             ], dim=1)
             
-        self.logger.info(f"init_buffer_embeds shape: {init_buffer_embeds.shape}")
+        self.logger.debug(f"init_buffer_embeds shape: {init_buffer_embeds.shape}")
         self.logger.debug(f"init_buffer_embeds sample: {init_buffer_embeds[0][:5]}")
     
         self.target_ids = self.init_target_ids
         init_buffer_losses = find_executable_batch_size(self._compute_candidates_loss_original, true_buffer_size)(init_buffer_embeds)
     
-        self.logger.info(f"init_buffer_losses shape: {init_buffer_losses.shape}")
+        self.logger.debug(f"init_buffer_losses shape: {init_buffer_losses.shape}")
         self.logger.debug(f"init_buffer_losses values: {init_buffer_losses}")
     
         for i in range(true_buffer_size):
@@ -234,7 +234,7 @@ class UniversalGCG(GCG):
     
         buffer.log_buffer(tokenizer)
     
-        self.logger.info("Initialized attack buffer.")
+        self.logger.debug("Initialized attack buffer.")
     
         return buffer
     
@@ -458,7 +458,7 @@ class UniversalGCG(GCG):
         
         candidate_seqs = torch.stack(candidate_seqs, dim=0)
         candidate_labels = torch.stack(candidate_labels, dim=0)
-        self.logger.info(f"Final candidate_seqs shape: {candidate_seqs.shape}")
+        self.logger.debug(f"Final candidate_seqs shape: {candidate_seqs.shape}")
         target_info = {'labels': candidate_labels}
         return candidate_seqs, target_info
 
@@ -520,10 +520,10 @@ class UniversalGCG(GCG):
             set_seed(config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
     
-        if not isinstance(messages, List[str]):
+        if not isinstance(messages, list):
             raise ValueError("Messages must be in the form of a list of strings.")
         
-        print("🔹 Processing prompts & targets for optimization...")
+        self.logger.info("🔹 Processing prompts & targets for optimization...")
         prep_result = self._prepare_prompt_data(messages, targets)
         # Store the original lists if needed for dual/draft operations.
         self.all_target_ids, self.all_before_embeds, self.all_after_embeds, self.all_target_embeds, *rest = prep_result
@@ -532,7 +532,7 @@ class UniversalGCG(GCG):
         else:
             self.secondary_target_ids = self.secondary_before_embeds = self.secondary_after_embeds = self.secondary_target_embeds = None
         
-        print("✅ Prompt & target processing complete.")
+        self.logger.info("✅ Prompt & target processing complete.")
         
         buffer = self.init_buffer_multi_prompt()
         optim_ids = buffer.get_best_ids()
@@ -551,15 +551,15 @@ class UniversalGCG(GCG):
         for index in range(outer):
             if config.incremental:
                 m_c += 1
-            print(f"\n🚀 Starting optimization for {m_c} message(s)...")
+            self.logger.info(f"\n🚀 Starting optimization for {m_c} message(s)...")
             losses = []
             optim_strings = []
             for step in tqdm(range(inner), desc="Optimizing Suffix"):
-                print(f"\n🔄 Step {step + 1}/{config.num_steps} - Computing token gradient...")
+                self.logger.info(f"\n🔄 Step {step + 1}/{config.num_steps} - Computing token gradient...")
                 optim_ids_onehot_grad = self.compute_token_gradient_multi(optim_ids, m_c)
     
-                print(f"🔍 Gradient Shape: {optim_ids_onehot_grad.shape}")
-                print(f"🔍 Optim IDs Before Sampling: {optim_ids}")
+                self.logger.debug(f"🔍 Gradient Shape: {optim_ids_onehot_grad.shape}")
+                self.logger.debug(f"🔍 Optim IDs Before Sampling: {optim_ids}")
     
                 with torch.no_grad():
                     sampled_ids = sample_ids_from_grad(
@@ -582,7 +582,7 @@ class UniversalGCG(GCG):
     
     
                     if self.config.probe_sampling_config is not None:
-                        print("🧮 Computing losses with draft model...")
+                        self.logger.info("🧮 Computing losses with draft model...")
                         # (Probe sampling branch would be updated similarly using batched candidates.)
                         current_loss, optim_ids = find_executable_batch_size(
                             self._compute_candidates_loss_probe_sampling_multi, batch_size
@@ -590,7 +590,7 @@ class UniversalGCG(GCG):
                           self.secondary_before_embeds[:m_c], self.secondary_after_embeds[:m_c],
                           self.secondary_target_embeds[:m_c], self.all_target_ids[:m_c], self.secondary_target_ids[:m_c])
                     elif self.dual_model is not None:
-                        print("🧮 Computing losses with dual model...")
+                        self.logger.info("🧮 Computing losses with dual model...")
                         loss_results = {}
                         loss_lock = Lock()
 
@@ -626,16 +626,16 @@ class UniversalGCG(GCG):
                         combined_losses_tensor = (losses_tensor + dual_losses_tensor.to(losses_tensor.device)) / 2
                         avg_losses = combined_losses_tensor.mean(dim=0)
 
-                        print(f"🔎 Main model losses: shape: {losses_tensor.shape}, first 10: {losses_tensor.flatten()[:10]}")
-                        print(f"🔎 Dual model losses: shape: {dual_losses_tensor.shape}, first 10: {dual_losses_tensor.flatten()[:10]}")
-                        print(f"🔎 Avg Losses: shape: {avg_losses.shape}, first 10: {avg_losses.flatten()[:10]}")
+                        self.logger.debug(f"🔎 Main model losses: shape: {losses_tensor.shape}, first 10: {losses_tensor.flatten()[:10]}")
+                        self.logger.debug(f"🔎 Dual model losses: shape: {dual_losses_tensor.shape}, first 10: {dual_losses_tensor.flatten()[:10]}")
+                        self.logger.debug(f"🔎 Avg Losses: shape: {avg_losses.shape}, first 10: {avg_losses.flatten()[:10]}")
 
                         current_loss = avg_losses.min().item()
                         best_idx = avg_losses.argmin().item()
                         optim_ids = sampled_ids[best_idx].unsqueeze(0)
 
                     else:
-                        print("🧮 Computing Losses...")
+                        self.logger.info("🧮 Computing Losses...")
                         losses_tensor = find_executable_batch_size(
                             self._compute_candidates_loss_multi_prompt, batch_size
                         )(candidate_seqs, target_info)
@@ -644,7 +644,7 @@ class UniversalGCG(GCG):
                         best_idx = avg_losses.argmin().item()
                         optim_ids = sampled_ids[best_idx].unsqueeze(0)
     
-                    print(f"✅ Loss: {current_loss}")
+                    self.logger.info(f"✅ Loss: {current_loss}")
                     losses.append(current_loss)
                     wandb.log({"Loss": current_loss})
     
@@ -655,11 +655,16 @@ class UniversalGCG(GCG):
                 optim_str = tokenizer.batch_decode(optim_ids)[0]
                 optim_strings.append(optim_str)
     
-                print(f"🔹 Current Best Optimized String: {optim_str}")
+                self.logger.info(f"🔹 Current Best Optimized String: {optim_str}")
     
                 if self.stop_flag:
-                    print("⚠️ Early stopping triggered due to finding a perfect match.")
+                    self.logger.info("⚠️ Early stopping triggered due to finding a perfect match.")
                     break
+                
+                if step % 10 == 0:
+                    with open(self.jailbreak_log, "a", newline="") as csvfile:
+                        writer = csv.writer(csvfile)
+                        writer.writerow([step, result.best_loss, result.best_string])
     
             min_loss_index = losses.index(min(losses))
     
@@ -669,13 +674,9 @@ class UniversalGCG(GCG):
                 losses=losses,
                 strings=optim_strings,
             )
-    
             results.append(result)
 
-            step_number = index * inner + min_loss_index
-            with open(self.jailbreak_log, "a", newline="") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow([step_number, result.best_loss, result.best_string])
+            # step_number = index * inner + min_loss_index
     
-        print("\n✅ **Suffix Optimization Completed Successfully!**")
+        self.logger.info("\n✅ **Suffix Optimization Completed Successfully!**")
         return results
