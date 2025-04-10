@@ -664,7 +664,7 @@ class UniversalGCG(GCG):
                 if step % 10 == 0:
                     with open(self.jailbreak_log, "a", newline="") as csvfile:
                         writer = csv.writer(csvfile)
-                        writer.writerow([step, result.best_loss, result.best_string])
+                        writer.writerow([step, min(losses) if losses else None, optim_strings[-1] if optim_strings else ""])
     
             min_loss_index = losses.index(min(losses))
     
