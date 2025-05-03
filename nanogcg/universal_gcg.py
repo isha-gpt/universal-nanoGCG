@@ -551,6 +551,36 @@ class UniversalGCG(GCG):
         for index in range(outer):
             if config.incremental:
                 m_c += 1
+                # Only prepare data for current subset of messages
+                current_messages = messages[:m_c]
+                current_targets = targets[:m_c]
+                prep_result = self._prepare_prompt_data(current_messages, current_targets)
+                self.all_target_ids, self.all_before_embeds, self.all_after_embeds, self.all_target_embeds, *rest = prep_result
+                if rest:
+                    self.secondary_target_ids, self.secondary_before_embeds, self.secondary_after_embeds, self.secondary_target_embeds = rest
+                else:
+                    self.secondary_target_ids = self.secondary_before_embeds = self.secondary_after_embeds = self.secondary_target_embeds = None
+                self.batch_before_embeds = self.batch_before_embeds[:m_c]
+                self.before_lengths = self.before_lengths[:m_c]
+                self.batch_after_embeds = self.batch_after_embeds[:m_c]
+                self.after_lengths = self.after_lengths[:m_c]
+                self.batch_target_embeds = self.batch_target_embeds[:m_c]
+                self.target_lengths = self.target_lengths[:m_c]
+                self.batch_target_ids = self.batch_target_ids[:m_c]
+
+                if self.dual_model:
+                    self.batch_secondary_before_embeds = self.batch_secondary_before_embeds[:m_c]
+                    self.secondary_before_lengths = self.secondary_before_lengths[:m_c]
+                    self.batch_secondary_after_embeds = self.batch_secondary_after_embeds[:m_c]
+                    self.secondary_after_lengths = self.secondary_after_lengths[:m_c]
+                    self.batch_secondary_target_embeds = self.batch_secondary_target_embeds[:m_c]
+                    self.secondary_target_lengths = self.secondary_target_lengths[:m_c]
+                    self.batch_secondary_target_ids = self.batch_secondary_target_ids[:m_c]
+
+            else:
+                current_messages = messages
+                current_targets = targets
+            
             self.logger.info(f"\n🚀 Starting optimization for {m_c} message(s)...")
             losses = []
             optim_strings = []
