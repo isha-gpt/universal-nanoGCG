@@ -16,6 +16,8 @@ class GCGConfig:
     optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
     search_width: int = 512
     batch_size: int = None
+    min_batch: int = 32  # Minimum batch size when scaling with prompts
+    candidates_per_prompt: int = 16  # Number of candidates to process per prompt
     topk: int = 256
     n_replace: int = 1
     buffer_size: int = 0

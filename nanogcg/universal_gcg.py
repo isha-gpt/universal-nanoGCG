@@ -574,7 +574,7 @@ class UniversalGCG(GCG):
                         sampled_ids = filter_ids(sampled_ids, tokenizer)
     
                     new_search_width = sampled_ids.shape[0]
-                    batch_size = new_search_width if config.batch_size is None else config.batch_size
+                    batch_size = max(config.min_batch, m_c * new_search_width)
     
                     # Build batched candidate sequences and target labels for all prompts.
                     candidate_seqs, target_info = self._build_candidate_batch(sampled_ids, m_c)
@@ -646,6 +646,7 @@ class UniversalGCG(GCG):
                     self.logger.info(f"✅ Loss: {current_loss}")
                     losses.append(current_loss)
                     wandb.log({"Loss": current_loss})
+                    wandb.log({"Best String": optim_str})
     
                     if buffer.size == 0 or current_loss < buffer.get_highest_loss():
                         buffer.add(current_loss, optim_ids)
