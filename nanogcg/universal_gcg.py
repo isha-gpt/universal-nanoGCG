@@ -1,45 +1,84 @@
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import torch
 from torch import Tensor
 from tqdm import tqdm
 import logging
 from nanogcg.configs import GCGResult
 from nanogcg.buffer import AttackBuffer
-from nanogcg.gcg import GCG 
-from nanogcg.utils import INIT_CHARS, find_executable_batch_size, filter_ids, sample_ids_from_grad, mellowmax
+from nanogcg.gcg import GCG
+from nanogcg.utils import (
+    INIT_CHARS,
+    find_executable_batch_size,  # we still fall back to this once, if needed
+    filter_ids,
+    sample_ids_from_grad,
+)
 from transformers import set_seed
-from scipy.stats import spearmanr
 import csv
 import os
 import wandb
 import threading
 from threading import Lock
 
+# ---------------------------------------------------------------------------
+#                                 GLOBALS
+# ---------------------------------------------------------------------------
+
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 
+torch.backends.cudnn.benchmark = True
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True  # Ampere+
+except AttributeError:
+    pass
+
+torch.set_float32_matmul_precision("high")
+
+# ---------------------------------------------------------------------------
+#                     tiny cache for safe batch‑sizes
+# ---------------------------------------------------------------------------
+_safe_batch_cache: Dict[Any, int] = {}
+
+def _cached_batch_size(key: Any, initial: int) -> int:
+    """Return the safe batch size stored under *key* or *initial* if absent."""
+    return _safe_batch_cache.get(key, initial)
+
+def _remember_batch_size(key: Any, batch_size: int) -> None:
+    """Remember that *batch_size* worked for *key*."""
+    _safe_batch_cache[key] = batch_size
+
+# ---------------------------------------------------------------------------
+#                    helpers — padding & candidate losses
+# ---------------------------------------------------------------------------
+
 def _pad_and_concat(tensor_list: List[Tensor], pad_value: int = 0) -> Tuple[Tensor, List[int]]:
-    """
-    Given a list of tensors of shape (seq_len, dim), pad them along dim=0 into a batch.
-    Returns a padded tensor of shape (batch, max_seq_len, dim) and a list of original lengths.
-    """
     lengths = [t.size(0) for t in tensor_list]
     padded = torch.nn.utils.rnn.pad_sequence(tensor_list, batch_first=True, padding_value=pad_value)
     return padded, lengths
 
+# ---------------------------------------------------------------------------
+#                             Universal GCG
+# ---------------------------------------------------------------------------
+
 class UniversalGCG(GCG):
-    """
-    A subclass of GCG that implements multi-prompt optimization methods with batched computations.
-    """
-    
-    def __init__(self, model, tokenizer, config, logger=None):
+    """Multi‑prompt optimisation with batched computations & caching."""
+
+    # ---------------------------------------------------------------------
+    #                              init / io
+    # ---------------------------------------------------------------------
+
+    def __init__(self, model, tokenizer, config, logger: logging.Logger | None = None):
         super().__init__(model, tokenizer, config)
         self.logger = logger or logging.getLogger("nanogcg")
-        
+
+        # jailbreak progress CSV ------------------------------------------------
         self.jailbreak_log = config.jailbreak_log
         os.makedirs(os.path.dirname(self.jailbreak_log), exist_ok=True)
-        with open(self.jailbreak_log, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["step", "loss", "suffix"]) 
+        with open(self.jailbreak_log, "w", newline="") as f:
+            csv.writer(f).writerow(["step", "loss", "suffix"])
+
+    # ---------------------------------------------------------------------
+    #                            prompt preparation
+    # ---------------------------------------------------------------------
     
     def _prepare_prompt_data(self, messages: List[str], targets: List[str]):
         """
@@ -461,222 +500,180 @@ class UniversalGCG(GCG):
         target_info = {'labels': candidate_labels}
         return candidate_seqs, target_info
 
+    # ---------------------------------------------------------------------
+    #                        batched candidate loss
+    # ---------------------------------------------------------------------
+
     def _compute_candidates_loss_multi_prompt(
         self,
         search_batch_size: int,
-        candidate_seqs: Tensor,   # shape: (num_prompts, num_candidates, seq_len, emb_dim)
+        candidate_seqs: Tensor,  # (num_prompts, num_candidates, L, D)
         target_info: dict,
-        dual: bool = False
+        *,
+        dual: bool = False,
     ) -> Tensor:
+        """Vectorised, allocation‑efficient cross‑entropy over a candidate grid."""
+
         model = self.dual_model if dual else self.model
-        num_prompts, num_candidates, seq_len, emb_dim = candidate_seqs.shape
-        # Flatten candidates: shape (num_prompts*num_candidates, seq_len, emb_dim)
-        flattened = candidate_seqs.view(num_prompts * num_candidates, seq_len, emb_dim)
-        # Flatten target labels accordingly.
-        flattened_target_labels = target_info['labels'].view(num_prompts * num_candidates, seq_len)
-        losses = []
-        for i in range(0, flattened.size(0), search_batch_size):
-            batch = flattened[i:i + search_batch_size]
-            # Slice target labels for this candidate batch.
-            batch_target_labels = flattened_target_labels[i:i + search_batch_size]
+        P, C, L, D = candidate_seqs.shape
+
+        flat_seqs   = candidate_seqs.view(P * C, L, D)
+        flat_labels = target_info["labels"].view(P * C, L)
+        losses: list[Tensor] = []
+
+        for start in range(0, flat_seqs.size(0), search_batch_size):
+            batch_seqs   = flat_seqs[start : start + search_batch_size]
+            batch_labels = flat_labels[start : start + search_batch_size]
+
             with torch.no_grad():
-                if self.prefix_cache:
-                    outputs = model(inputs_embeds=batch, past_key_values=self.prefix_cache, use_cache=True)
-                else:
-                    outputs = model(inputs_embeds=batch)
-                logits = outputs.logits
-                loss_batch = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    batch_target_labels.view(-1),
-                    ignore_index=-100,
-                    reduction='none'
+                outputs = (
+                    model(inputs_embeds=batch_seqs, past_key_values=self.prefix_cache, use_cache=True)
+                    if self.prefix_cache else
+                    model(inputs_embeds=batch_seqs)
                 )
-                loss_batch = loss_batch.view(batch.size(0), seq_len)
-                candidate_losses = []
-                for j in range(batch.size(0)):
-                    valid = (batch_target_labels[j] != -100)
-                    if valid.sum() > 0:
-                        candidate_losses.append(loss_batch[j][valid].mean())
-                    else:
-                        candidate_losses.append(torch.tensor(0., device=loss_batch.device))
-                losses.append(torch.stack(candidate_losses))
-        losses_tensor = torch.cat(losses)  # This should now have num_prompts*num_candidates elements.
-        losses_tensor = losses_tensor.view(num_prompts, num_candidates)
-        return losses_tensor
+                logits = outputs.logits  # (B, L, V)
 
-    def run_multi_prompt(
-        self,
-        messages: List[str],
-        targets: List[str],
-    ) -> GCGResult:
-        
-        tokenizer = self.tokenizer
-        config = self.config
+                token_loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    batch_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).view(batch_seqs.size(0), L)
 
-        assert not (config.dual_model and config.probe_sampling_config), "Cannot run with both dual model and probe sampling config."
-        
-        if config.seed is not None:
-            set_seed(config.seed)
+                valid = batch_labels.ne(-100)
+                loss_sum = (token_loss * valid).sum(dim=1)
+                losses.append(loss_sum / valid.sum(dim=1).clamp(min=1))
+
+        return torch.cat(losses).view(P, C)
+
+    # ---------------------------------------------------------------------
+    #                          main optimisation loop
+    # ---------------------------------------------------------------------
+
+    def run_multi_prompt(self, messages: List[str], targets: List[str]) -> GCGResult:
+        tokenizer, cfg = self.tokenizer, self.config
+
+        if cfg.seed is not None:
+            set_seed(cfg.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
-    
-        if not isinstance(messages, list):
-            raise ValueError("Messages must be in the form of a list of strings.")
-        
-        self.logger.info("🔹 Processing prompts & targets for optimization...")
-        prep_result = self._prepare_prompt_data(messages, targets)
-        # Store the original lists if needed for dual/draft operations.
-        self.all_target_ids, self.all_before_embeds, self.all_after_embeds, self.all_target_embeds, *rest = prep_result
+
+        # ‑‑‑ prepare contexts -------------------------------------------------
+        self.logger.info("🔹 Processing prompts & targets …")
+        prep = self._prepare_prompt_data(messages, targets)
+        (self.all_target_ids, self.all_before_embeds, self.all_after_embeds,
+         self.all_target_embeds, *rest) = prep
         if rest:
-            self.secondary_target_ids, self.secondary_before_embeds, self.secondary_after_embeds, self.secondary_target_embeds = rest
+            (self.secondary_target_ids, self.secondary_before_embeds,
+             self.secondary_after_embeds, self.secondary_target_embeds) = rest
         else:
-            self.secondary_target_ids = self.secondary_before_embeds = self.secondary_after_embeds = self.secondary_target_embeds = None
-        
-        self.logger.info("✅ Prompt & target processing complete.")
-        
-        buffer = self.init_buffer_multi_prompt()
+            self.secondary_target_ids = self.secondary_before_embeds = (
+                self.secondary_after_embeds) = self.secondary_target_embeds = None
+        self.logger.info("✅ Prompt processing complete.")
+
+        buffer   = self.init_buffer_multi_prompt()
         optim_ids = buffer.get_best_ids()
 
-        results = []
-
-        if config.incremental:
-            outer = len(messages)
-            inner = config.num_steps // outer
-            m_c = 0
+        if cfg.incremental:
+            outer, inner, m_c = len(messages), cfg.num_steps // len(messages), 0
         else:
-            outer = 1
-            inner = config.num_steps
-            m_c = len(messages)
-        
-        for index in range(outer):
-            if config.incremental:
+            outer, inner, m_c = 1, cfg.num_steps, len(messages)
+
+        results: list[GCGResult] = []
+
+        for block in range(outer):
+            if cfg.incremental:
                 m_c += 1
-            self.logger.info(f"\n🚀 Starting optimization for {m_c} message(s)...")
-            losses = []
-            optim_strings = []
-            for step in tqdm(range(inner), desc="Optimizing Suffix"):
-                self.logger.info(f"\n🔄 Step {step + 1}/{config.num_steps} - Computing token gradient...")
-                optim_ids_onehot_grad = self.compute_token_gradient_multi(optim_ids, m_c)
-    
-                self.logger.debug(f"🔍 Gradient Shape: {optim_ids_onehot_grad.shape}")
-                self.logger.debug(f"🔍 Optim IDs Before Sampling: {optim_ids}")
-    
+
+            self.logger.info(f"\n🚀 Optimising {m_c} message(s) …")
+            step_losses, step_suffixes = [], []
+
+            for step in tqdm(range(inner), desc="Optimising Suffix"):
+                self.logger.info(f"\n🔄 Step {step + 1}/{cfg.num_steps} – gradient")
+                grad = self.compute_token_gradient_multi(optim_ids, m_c).squeeze(0)
+
                 with torch.no_grad():
-                    sampled_ids = sample_ids_from_grad(
-                        optim_ids.squeeze(0),
-                        optim_ids_onehot_grad.squeeze(0),
-                        config.search_width,
-                        config.topk,
-                        config.n_replace,
+                    sampled = sample_ids_from_grad(
+                        optim_ids.squeeze(0), grad,
+                        cfg.search_width, cfg.topk, cfg.n_replace,
                         not_allowed_ids=self.not_allowed_ids,
                     )
-    
-                    if config.filter_ids:
-                        sampled_ids = filter_ids(sampled_ids, tokenizer)
-    
-                    new_search_width = sampled_ids.shape[0]
-                    batch_size = max(config.min_batch, m_c * new_search_width)
-    
-                    # Build batched candidate sequences and target labels for all prompts.
-                    candidate_seqs, target_info = self._build_candidate_batch(sampled_ids, m_c)
-    
-    
-                    if self.config.probe_sampling_config is not None:
-                        self.logger.info("🧮 Computing losses with draft model...")
-                        # (Probe sampling branch would be updated similarly using batched candidates.)
-                        current_loss, optim_ids = find_executable_batch_size(
-                            self._compute_candidates_loss_probe_sampling_multi, batch_size
-                        )(candidate_seqs, sampled_ids, 
-                          self.secondary_before_embeds[:m_c], self.secondary_after_embeds[:m_c],
-                          self.secondary_target_embeds[:m_c], self.all_target_ids[:m_c], self.secondary_target_ids[:m_c])
-                    elif self.dual_model is not None:
-                        self.logger.info("🧮 Computing losses with dual model...")
-                        loss_results = {}
-                        loss_lock = Lock()
+                    if cfg.filter_ids:
+                        sampled = filter_ids(sampled, tokenizer)
 
-                        def compute_primary():
-                            primary_loss = find_executable_batch_size(self._compute_candidates_loss_multi_prompt, batch_size)(candidate_seqs, target_info)
-                            with loss_lock:
-                                loss_results['primary'] = primary_loss
+                    new_sw = sampled.size(0)
+                    init_bs = max(cfg.min_batch, m_c * new_sw)
 
-                        def compute_dual():
-                            dual_candidate_seqs, dual_target_info = self._build_candidate_batch(sampled_ids, m_c, dual=True)
-                            dual_loss = find_executable_batch_size(self._compute_candidates_loss_multi_prompt, batch_size)(
-                                dual_candidate_seqs, dual_target_info, dual=True
-                            )
-                            with loss_lock:
-                                loss_results['dual'] = dual_loss
+                    # ––––– loss helper w/ caching –––––––––––––––––––––––
+                    def _loss_with_cache(key, cand_seqs, tgt_info, dual=False):
+                        bs = _cached_batch_size(key, init_bs)
+                        try:
+                            out = self._compute_candidates_loss_multi_prompt(bs, cand_seqs, tgt_info, dual=dual)
+                            _remember_batch_size(key, bs)
+                            return out
+                        except RuntimeError as e:
+                            if "out of memory" not in str(e).lower():
+                                raise
+                            # one‑off fallback to slow shrink helper
+                            out = find_executable_batch_size(
+                                self._compute_candidates_loss_multi_prompt, bs
+                            )(cand_seqs, tgt_info, dual=dual)
+                            # helper prints "Decreasing batch size …" once; cache final size
+                            final_bs = _cached_batch_size(key, bs // 2)
+                            _remember_batch_size(key, final_bs)
+                            return out
 
-                        # Create and start threads for each computation.
-                        thread_primary = threading.Thread(target=compute_primary)
-                        thread_dual = threading.Thread(target=compute_dual)
+                    # build primary candidates once -------------------
+                    cand_seqs, tgt_info = self._build_candidate_batch(sampled, m_c)
 
-                        thread_primary.start()
-                        thread_dual.start()
+                    if self.dual_model is not None:
+                        # threaded primary + dual ---------------------
+                        loss_dict: Dict[str, Tensor] = {}
+                        lock = Lock()
 
-                        # Wait for both threads to complete.
-                        thread_primary.join()
-                        thread_dual.join()
+                        def _run_primary():
+                            loss = _loss_with_cache(("pri", m_c, new_sw), cand_seqs, tgt_info)
+                            with lock:
+                                loss_dict["pri"] = loss
 
-                        # Retrieve the computed losses.
-                        losses_tensor = loss_results['primary']
-                        dual_losses_tensor = loss_results['dual']
+                        def _run_dual():
+                            d_seqs, d_info = self._build_candidate_batch(sampled, m_c, dual=True)
+                            loss = _loss_with_cache(("du", m_c, new_sw), d_seqs, d_info, dual=True)
+                            with lock:
+                                loss_dict["du"] = loss
 
-                        # Combine the losses (here by averaging, adjust as needed).
-                        combined_losses_tensor = (losses_tensor + dual_losses_tensor.to(losses_tensor.device)) / 2
-                        avg_losses = combined_losses_tensor.mean(dim=0)
+                        t1, t2 = threading.Thread(target=_run_primary), threading.Thread(target=_run_dual)
+                        t1.start(); t2.start(); t1.join(); t2.join()
 
-                        self.logger.debug(f"🔎 Main model losses: shape: {losses_tensor.shape}, first 10: {losses_tensor.flatten()[:10]}")
-                        self.logger.debug(f"🔎 Dual model losses: shape: {dual_losses_tensor.shape}, first 10: {dual_losses_tensor.flatten()[:10]}")
-                        self.logger.debug(f"🔎 Avg Losses: shape: {avg_losses.shape}, first 10: {avg_losses.flatten()[:10]}")
-
-                        current_loss = avg_losses.min().item()
-                        best_idx = avg_losses.argmin().item()
-                        optim_ids = sampled_ids[best_idx].unsqueeze(0)
-
+                        losses_tensor = (loss_dict["pri"] + loss_dict["du"].to(loss_dict["pri"].device)) / 2
                     else:
-                        self.logger.info("🧮 Computing Losses...")
-                        losses_tensor = find_executable_batch_size(
-                            self._compute_candidates_loss_multi_prompt, batch_size
-                        )(candidate_seqs, target_info)
-                        avg_losses = losses_tensor.mean(dim=0)
-                        current_loss = avg_losses.min().item()
-                        best_idx = avg_losses.argmin().item()
-                        optim_ids = sampled_ids[best_idx].unsqueeze(0)
-    
-                    self.logger.info(f"✅ Loss: {current_loss}")
-                    losses.append(current_loss)
-                    wandb.log({"Loss": current_loss})
-                    wandb.log({"Best String": optim_str})
-    
-                    if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                        buffer.add(current_loss, optim_ids)
-    
-                optim_ids = buffer.get_best_ids()
-                optim_str = tokenizer.batch_decode(optim_ids)[0]
-                optim_strings.append(optim_str)
-    
-                self.logger.info(f"🔹 Current Best Optimized String: {optim_str}")
-    
-                if self.stop_flag:
-                    self.logger.info("⚠️ Early stopping triggered due to finding a perfect match.")
-                    break
-                
-                if step % 10 == 0:
-                    with open(self.jailbreak_log, "a", newline="") as csvfile:
-                        writer = csv.writer(csvfile)
-                        writer.writerow([step, min(losses) if losses else None, optim_strings[-1] if optim_strings else ""])
-    
-            min_loss_index = losses.index(min(losses))
-    
-            result = GCGResult(
-                best_loss=losses[min_loss_index],
-                best_string=optim_strings[min_loss_index],
-                losses=losses,
-                strings=optim_strings,
-            )
-            results.append(result)
+                        losses_tensor = _loss_with_cache(("pri", m_c, new_sw), cand_seqs, tgt_info)
 
-            # step_number = index * inner + min_loss_index
-    
-        self.logger.info("\n✅ **Suffix Optimization Completed Successfully!**")
+                    avg_losses = losses_tensor.mean(dim=0)
+                    current_loss, best_idx = avg_losses.min().item(), avg_losses.argmin().item()
+                    optim_ids = sampled[best_idx].unsqueeze(0)
+
+                # logging ----------------------------------------------------
+                step_losses.append(current_loss)
+                wandb.log({"Loss": current_loss})
+
+                if buffer.size == 0 or current_loss < buffer.get_highest_loss():
+                    buffer.add(current_loss, optim_ids)
+
+                optim_ids = buffer.get_best_ids()
+                best_str  = tokenizer.batch_decode(optim_ids)[0]
+                step_suffixes.append(best_str)
+                self.logger.info(f"🔹 Best string so far: {best_str}")
+                if step % 10 == 0:
+                    wandb.log({"Current Best String": best_str})
+
+            # block result ----------------------------------------------------
+            i_min = step_losses.index(min(step_losses))
+            results.append(GCGResult(
+                best_loss=min(step_losses),
+                best_string=step_suffixes[i_min],
+                losses=step_losses,
+                strings=step_suffixes,
+            ))
+
+        self.logger.info("\n✅ Suffix optimisation finished!")
         return results
