@@ -8,3 +8,5 @@ results/
 
 env
 venv
+
+*.pyc

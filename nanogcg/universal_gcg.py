@@ -529,7 +529,7 @@ class UniversalGCG(GCG):
                 outputs = (
                     model(inputs_embeds=batch_seqs, past_key_values=self.prefix_cache, use_cache=True)
                     if self.prefix_cache else
-                    model(inputs_embeds=batch_seqs)
+                    model(inputs_embeds=batch_seqs, use_cache=True)
                 )
                 logits = outputs.logits  # (B, L, V)
 
